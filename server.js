@@ -14,16 +14,21 @@ import { simpleParser } from 'mailparser';
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
+import crypto from 'crypto';
 
 // Load environment variables from .env file (for local development)
 dotenv.config();
+
+// Signed OAuth token lifetimes, in seconds
+const ACCESS_TOKEN_TTL = 365 * 24 * 3600;
+const REFRESH_TOKEN_TTL = 2 * 365 * 24 * 3600;
 
 class YahooMailMCPServer {
     constructor() {
         this.server = new Server(
             {
                 name: 'yahoo-mail-mcp',
-                version: '3.0.0',
+                version: '3.1.0',
             },
             {
                 capabilities: {
@@ -35,9 +40,8 @@ class YahooMailMCPServer {
         // Store active SSE transports (for routing messages)
         this.transports = new Map();
 
-        // Store valid OAuth access tokens (in-memory)
-        // In production, use Redis or a database with TTL
-        this.validTokens = new Set();
+        // OAuth tokens are signed (HMAC-SHA256), not stored, so restarts and redeploys don't sign clients out.
+        // Key: TOKEN_SIGNING_SECRET if set, else OAUTH_CLIENT_SECRET. Change the key to revoke every token.
 
         // Store authorization codes for OAuth authorization code flow
         // In production, use Redis with short TTL (60 seconds)
@@ -45,6 +49,63 @@ class YahooMailMCPServer {
 
         this.setupToolHandlers();
         this.setupErrorHandling();
+    }
+
+    /**
+     * Sign a token payload with the server's signing key
+     */
+    signToken(payload) {
+        const key = process.env.TOKEN_SIGNING_SECRET || process.env.OAUTH_CLIENT_SECRET;
+        return crypto.createHmac('sha256', key).update(payload).digest('base64url');
+    }
+
+    /**
+     * Issue a signed OAuth token ('access' or 'refresh'). Nothing is stored server-side.
+     */
+    issueToken(type, clientId, ttlSeconds, scope) {
+        const payload = Buffer.from(JSON.stringify({
+            typ: type,
+            cid: clientId,
+            scope,
+            exp: Math.floor(Date.now() / 1000) + ttlSeconds
+        })).toString('base64url');
+        return `${payload}.${this.signToken(payload)}`;
+    }
+
+    /**
+     * Verify a signed OAuth token of the given type. Returns its claims, or null if invalid or expired.
+     */
+    verifyToken(token, type) {
+        const parts = String(token || '').split('.');
+        if (parts.length !== 2) return null;
+        const [payload, signature] = parts;
+        if (!payload || !signature) return null;
+
+        const expected = Buffer.from(this.signToken(payload));
+        const given = Buffer.from(signature);
+        if (given.length !== expected.length || !crypto.timingSafeEqual(given, expected)) return null;
+
+        try {
+            const claims = JSON.parse(Buffer.from(payload, 'base64url').toString());
+            if (claims.typ !== type || claims.cid !== process.env.OAUTH_CLIENT_ID) return null;
+            if (!(claims.exp > Math.floor(Date.now() / 1000))) return null;
+            return claims;
+        } catch {
+            return null;
+        }
+    }
+
+    /**
+     * Build the token endpoint response: a new access token plus a refresh token
+     */
+    tokenResponse(clientId, scope) {
+        return {
+            access_token: this.issueToken('access', clientId, ACCESS_TOKEN_TTL, scope),
+            token_type: 'Bearer',
+            expires_in: ACCESS_TOKEN_TTL,
+            refresh_token: this.issueToken('refresh', clientId, REFRESH_TOKEN_TTL, scope),
+            scope
+        };
     }
 
     /**
@@ -1330,8 +1391,8 @@ class YahooMailMCPServer {
 
             const token = authHeader.substring(7); // Remove 'Bearer ' prefix
 
-            // Validate token (check if it's in our valid tokens set)
-            if (!this.validTokens || !this.validTokens.has(token)) {
+            // Validate token (signature, type and expiry)
+            if (!this.verifyToken(token, 'access')) {
                 console.error('[Auth] Invalid or expired access token');
                 return res.status(401).json({
                     error: 'invalid_token',
@@ -1353,7 +1414,7 @@ class YahooMailMCPServer {
                 issuer: baseUrl,
                 authorization_endpoint: `${baseUrl}/oauth/authorize`,
                 token_endpoint: `${baseUrl}/oauth/token`,
-                grant_types_supported: ['authorization_code', 'client_credentials'],
+                grant_types_supported: ['authorization_code', 'refresh_token', 'client_credentials'],
                 response_types_supported: ['code'],
                 token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post'],
                 code_challenge_methods_supported: ['S256'],
@@ -1457,7 +1518,7 @@ class YahooMailMCPServer {
             res.redirect(redirectUrl.toString());
         });
 
-        // OAuth Token Endpoint (supports both Authorization Code and Client Credentials flows)
+        // OAuth Token Endpoint (supports Authorization Code, Refresh Token and Client Credentials flows)
         app.post('/oauth/token', async (req, res) => {
             console.error('[OAuth] Token request - grant type:', req.body?.grant_type || 'unknown');
 
@@ -1528,32 +1589,35 @@ class YahooMailMCPServer {
                 // Delete used auth code (one-time use)
                 this.authCodes.delete(code);
 
-                // Generate access token
-                const accessToken = Buffer.from(`${reqClientId}:${Date.now()}:${Math.random()}`).toString('base64');
-                this.validTokens.add(accessToken);
-
                 console.error('[OAuth] Access token generated from authorization code');
 
-                return res.json({
-                    access_token: accessToken,
-                    token_type: 'Bearer',
-                    expires_in: 3600,
-                    scope: authData.scope || 'mcp'
-                });
+                return res.json(this.tokenResponse(reqClientId, authData.scope || 'mcp'));
+            }
+
+            // Handle Refresh Token Grant
+            if (grantType === 'refresh_token') {
+                const claims = this.verifyToken(req.body?.refresh_token, 'refresh');
+                if (!claims) {
+                    console.error('[OAuth] Invalid or expired refresh token');
+                    return res.status(400).json({
+                        error: 'invalid_grant',
+                        error_description: 'Invalid or expired refresh token'
+                    });
+                }
+
+                console.error('[OAuth] Access token refreshed');
+
+                return res.json(this.tokenResponse(reqClientId, claims.scope || 'mcp'));
             }
 
             // Handle Client Credentials Grant
             if (grantType === 'client_credentials') {
-                // Generate access token
-                const accessToken = Buffer.from(`${clientId}:${Date.now()}:${Math.random()}`).toString('base64');
-                this.validTokens.add(accessToken);
-
                 console.error('[OAuth] Access token generated via client credentials');
 
                 return res.json({
-                    access_token: accessToken,
+                    access_token: this.issueToken('access', clientId, ACCESS_TOKEN_TTL, 'mcp'),
                     token_type: 'Bearer',
-                    expires_in: 3600,
+                    expires_in: ACCESS_TOKEN_TTL,
                     scope: 'mcp'
                 });
             }
@@ -1562,7 +1626,7 @@ class YahooMailMCPServer {
             console.error('[OAuth] Unsupported grant type:', grantType);
             res.status(400).json({
                 error: 'unsupported_grant_type',
-                error_description: 'Supported grant types: authorization_code, client_credentials'
+                error_description: 'Supported grant types: authorization_code, refresh_token, client_credentials'
             });
         });
 
@@ -1580,7 +1644,7 @@ class YahooMailMCPServer {
             res.json({
                 status: 'ok',
                 service: 'yahoo-mail-mcp',
-                version: '3.0.0',
+                version: '3.1.0',
                 timestamp: new Date().toISOString(),
                 environment: {
                     nodeVersion: process.version,
@@ -1665,7 +1729,7 @@ class YahooMailMCPServer {
         app.get('/', (req, res) => {
             res.json({
                 name: 'Yahoo Mail MCP Server',
-                version: '3.0.0',
+                version: '3.1.0',
                 description: 'MCP server for Yahoo Mail access via IMAP',
                 endpoints: {
                     health: '/health',
